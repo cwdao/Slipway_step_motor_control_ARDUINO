@@ -1,4 +1,4 @@
-#include "AccelStepper.h"
+#include ".\\AccelStepper.h"
 
 // 步进脉冲和方向引脚
 #define PUL_PIN 3
@@ -20,6 +20,8 @@ void setup() {
   stepper.setMaxSpeed(1000);    // 设置最大速度（步/秒）
   stepper.setAcceleration(500); // 设置加速度
 
+  pinMode(LED_BUILTIN, OUTPUT);
+
   // 设置微动开关为输入并启用内部上拉
   pinMode(SWITCH_FORWARD, INPUT_PULLUP);
   pinMode(SWITCH_BACKWARD, INPUT_PULLUP);
@@ -30,12 +32,15 @@ void loop() {
   bool backwardPressed = digitalRead(SWITCH_BACKWARD) == LOW;
 
   if (forwardPressed && !backwardPressed) {
+    digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
     stepper.setSpeed(500);  // 正向旋转
     stepper.runSpeed();
   } else if (backwardPressed && !forwardPressed) {
+    digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
     stepper.setSpeed(-500); // 反向旋转
     stepper.runSpeed();
   } else {
     stepper.setSpeed(0); // 停止
+    digitalWrite(LED_BUILTIN, LOW);  // turn the LED on (HIGH is the voltage level)
   }
 }
