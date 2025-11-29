@@ -32,6 +32,35 @@ Arduino Uno项目，用于控制滑道步进电机，支持手动控制和周期
 ### LED指示
 - `LED_BUILTIN` (Pin 13): 板载LED，用于状态指示
 
+## 按钮状态检测原理
+
+代码使用边沿检测来判断按钮是否被按下。由于使用了内部上拉电阻（`INPUT_PULLUP`），按钮的工作原理如下：
+
+- **未按下**：引脚通过上拉电阻连接到高电平（HIGH，约5V）
+- **按下**：引脚接地（LOW，约0V）
+
+代码中的检测逻辑：
+```cpp
+bool forwardPressed = digitalRead(SWITCH_FORWARD) == LOW;
+```
+
+### 状态变化过程
+
+按钮状态变化时的检测逻辑如下表所示：
+
+| 时刻 | 物理电平 | `forwardPressed` | `lastForwardState` | 条件判断 `forwardPressed && !lastForwardState` | 是否触发检测 |
+|------|---------|------------------|-------------------|-----------------------------------------------|------------|
+| 初始 | HIGH | `false` | `false` | `false && !false` = `false` | ❌ 否 |
+| 按下瞬间 | LOW | `true` | `false` | `true && !false` = `true` | ✅ **是** |
+| 按住 | LOW | `true` | `true` | `true && !true` = `false` | ❌ 否 |
+| 松开瞬间 | HIGH | `false` | `true` | `false && !true` = `false` | ❌ 否 |
+| 松开后 | HIGH | `false` | `false` | `false && !false` = `false` | ❌ 否 |
+
+**关键点**：
+- 代码只检测**按下边沿**（下降沿：HIGH → LOW），不检测松开边沿（上升沿：LOW → HIGH）
+- 只有在按钮从**未按下变为按下**的瞬间才会触发双击检测
+- 这样可以避免在按钮松开时误触发检测
+
 ## 使用方法
 
 ### 手动控制模式（默认）
