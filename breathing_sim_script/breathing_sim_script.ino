@@ -48,8 +48,8 @@ enum RunState {
   ST_START_DELAY,
   ST_SEGMENT_INIT,
   ST_MOVE_TO_EXHALE_END,   // 先到呼气末(下端点)
-  ST_HALF_CYCLE_UP,        // 上行：呼气末 -> 吸气末
-  ST_HALF_CYCLE_DOWN,      // 下行：吸气末 -> 呼气末
+  ST_INHALE_UP,            // 上行：呼气末 -> 吸气末（吸气 Tin）
+  ST_EXHALE_DOWN,          // 下行：吸气末 -> 呼气末（呼气 Tex）
   ST_APNEA_HOLD,           // 暂停保持在呼气末
   ST_DONE
 };
@@ -64,8 +64,13 @@ static uint32_t lastAmpUpdate_ms = 0;
 static uint8_t amp_mm = AMP_MIN_MM;
 static int8_t amp_dir = +1;                 // +1 增，-1 减
 
-static uint32_t halfCycleDuration_ms = 0;   // 半周期时间
-static float cruiseSpeed_steps_s = 0;       // 匀速段目标速度（由幅值和bpm决定）
+// 吸/呼时长（期望值，用于计算速度目标）
+static uint32_t inhaleDuration_ms = 0;
+static uint32_t exhaleDuration_ms = 0;
+
+// I:E 比例参数（I:E = 1 : exhaleRatio）
+static float exhaleRatio = 1.0f;            // 例如 1.5 表示 1:1.5
+static float cruiseSpeed_steps_s = 0;        // 当前半周期设置的 maxSpeed（用于打印）
 
 static uint16_t breathsCompleted = 0;       // 完整呼吸周期计数（下行结束算完成一个周期）
 static bool apneaDoneInThisSeg = false;
@@ -73,36 +78,6 @@ static bool apneaDoneInThisSeg = false;
 // ====== 工具函数 ======
 static inline long mmToSteps(float mm) {
   return lround(mm * STEPS_PER_MM);
-}
-
-// 计算当前段(bpm) + 当前幅值(mm)下的半周期时间和速度上限
-void updateKinematics(uint8_t bpm, uint8_t ampMM) {
-  // 周期(s) = 60/bpm；半周期(s)=30/bpm
-  float half_s = 30.0f / (float)bpm;
-  halfCycleDuration_ms = (uint32_t)lround(half_s * 1000.0f);
-
-  // 从 -A 到 +A 的位移是 2A（A=幅值），半周期走 2A
-  float dist_mm = 2.0f * (float)ampMM;
-  float v_mm_s = dist_mm / half_s; // 近似匀速段速度需求
-  cruiseSpeed_steps_s = v_mm_s * STEPS_PER_MM;
-
-  // 安全限幅
-  if (cruiseSpeed_steps_s > MAX_SPEED_STEPS_S) cruiseSpeed_steps_s = MAX_SPEED_STEPS_S;
-
-  stepper.setMaxSpeed(cruiseSpeed_steps_s);
-  stepper.setAcceleration(ACCEL_STEPS_S2);
-}
-
-// 幅值更新：5->10->5 循环
-void updateAmplitude() {
-  if (amp_mm == AMP_MAX_MM) amp_dir = -1;
-  else if (amp_mm == AMP_MIN_MM) amp_dir = +1;
-  amp_mm = (uint8_t)((int)amp_mm + (int)amp_dir);
-}
-
-void beep(uint16_t freq, uint16_t ms) {
-  // tone 对无源蜂鸣器有效；对部分有源蜂鸣器也可工作
-  tone(BUZZER_PIN, freq, ms);
 }
 
 bool segmentTimeUp() {
@@ -117,6 +92,64 @@ long inhaleEndPos() { // 吸气末：上端点
   return CENTER_POS_STEPS + mmToSteps((float)amp_mm);
 }
 
+// 幅值更新：5->10->5 循环
+void updateAmplitude() {
+  if (amp_mm == AMP_MAX_MM) amp_dir = -1;
+  else if (amp_mm == AMP_MIN_MM) amp_dir = +1;
+  amp_mm = (uint8_t)((int)amp_mm + (int)amp_dir);
+}
+
+void beep(uint16_t freq, uint16_t ms) {
+  tone(BUZZER_PIN, freq, ms);
+}
+
+// ====== I:E 策略：按段 + 呼吸次数选择 exhaleRatio ======
+float getExhaleRatioForNow(uint8_t segIndex, uint16_t breathsCompletedInSeg) {
+  // breathsCompletedInSeg：已完成的完整呼吸数（下行到下端点时++）
+  // 9 bpm 段：前 9 次 1:1，后 9 次 1:1.5
+  if (segIndex == 0) {
+    if (breathsCompletedInSeg < 9) return 1.0f;   // 第1~9次
+    else return 1.5f;                              // 第10次开始
+  }
+  // 12 bpm：1:1.5
+  if (segIndex == 1) return 1.5f;
+  // 16 bpm：1:1.3
+  if (segIndex == 2) return 1.3f;
+  // 18 bpm：1:1.2
+  if (segIndex == 3) return 1.2f;
+
+  return 1.0f;
+}
+
+// 根据 bpm + I:E 计算 Tin/Tex（单位 ms）
+void updateInhaleExhaleDurations(uint8_t bpm, float exhaleRatioNow) {
+  float T = 60.0f / (float)bpm;           // 周期(s)
+  float Tin = T * (1.0f / (1.0f + exhaleRatioNow));
+  float Tex = T * (exhaleRatioNow / (1.0f + exhaleRatioNow));
+
+  inhaleDuration_ms = (uint32_t)lround(Tin * 1000.0f);
+  exhaleDuration_ms = (uint32_t)lround(Tex * 1000.0f);
+}
+
+// 为“某个半周期”设置 maxSpeed（用 duration_ms 来决定速度需求）
+void setSpeedForHalfCycle(uint32_t duration_ms) {
+  // 半周期位移：从 -A 到 +A 或 +A 到 -A，位移都是 2A (mm)
+  float dist_mm = 2.0f * (float)amp_mm;
+  float dur_s = (float)duration_ms / 1000.0f;
+  if (dur_s < 0.001f) dur_s = 0.001f;
+
+  float v_mm_s = dist_mm / dur_s;
+  float v_steps_s = v_mm_s * STEPS_PER_MM;
+
+  // 安全限幅
+  if (v_steps_s > MAX_SPEED_STEPS_S) v_steps_s = MAX_SPEED_STEPS_S;
+
+  cruiseSpeed_steps_s = v_steps_s;
+  stepper.setMaxSpeed(cruiseSpeed_steps_s);
+  stepper.setAcceleration(ACCEL_STEPS_S2);
+}
+
+// ====== 串口打印辅助 ======
 static void printSegments() {
   Serial.println(F("=== Segment table ==="));
   for (uint8_t i = 0; i < NUM_SEG; i++) {
@@ -137,6 +170,20 @@ static void printSegments() {
   Serial.println(F("====================="));
 }
 
+static void printIERuntime(uint8_t bpm) {
+  Serial.print(F("  I:E=1:"));
+  Serial.print(exhaleRatio, 3);
+  Serial.print(F("  Tin_ms="));
+  Serial.print(inhaleDuration_ms);
+  Serial.print(F("  Tex_ms="));
+  Serial.println(exhaleDuration_ms);
+  Serial.print(F("  amp_mm="));
+  Serial.print(amp_mm);
+  Serial.print(F(" (steps="));
+  Serial.print(mmToSteps((float)amp_mm));
+  Serial.println(F(")"));
+}
+
 void setup() {
   pinMode(ENA_PIN, OUTPUT);
   digitalWrite(ENA_PIN, LOW); // 使能（按你驱动器逻辑，LOW=Enable）
@@ -146,11 +193,9 @@ void setup() {
   Serial.begin(115200);
   delay(50);
   Serial.println();
-  Serial.println(F("breathing_sim_script.ino starting..."));
+  Serial.println(F("breathing_sim_script.ino starting... (I:E enabled)"));
   Serial.print(F("STEPS_PER_MM="));
   Serial.println(STEPS_PER_MM, 4);
-  Serial.print(F("CENTER_POS_STEPS="));
-  Serial.println(CENTER_POS_STEPS);
   Serial.print(F("MAX_SPEED_STEPS_S="));
   Serial.println(MAX_SPEED_STEPS_S, 2);
   Serial.print(F("ACCEL_STEPS_S2="));
@@ -167,11 +212,13 @@ void setup() {
   Serial.println(AMP_UPDATE_INTERVAL_MS);
   printSegments();
 
-  stepper.setMinPulseWidth(2); // 视驱动器需要可调(微秒)
+  stepper.setMinPulseWidth(2);
   stepper.setCurrentPosition(CENTER_POS_STEPS);
 
-  // 初始运动学参数（先用第一段bpm + 初始幅值）
-  updateKinematics(segments[0].bpm, amp_mm);
+  // 初始 I:E（按第1段、breathsCompleted=0）
+  exhaleRatio = getExhaleRatioForNow(0, 0);
+  updateInhaleExhaleDurations(segments[0].bpm, exhaleRatio);
+  setSpeedForHalfCycle(inhaleDuration_ms);
 
   // 上电提示
   beep(1200, 150);
@@ -182,9 +229,7 @@ void setup() {
 }
 
 void loop() {
-  // 必须尽可能频繁调用
   stepper.run();
-
   uint32_t now = millis();
 
   switch (state) {
@@ -196,7 +241,6 @@ void loop() {
     } break;
 
     case ST_SEGMENT_INIT: {
-      // 段初始化
       segStart_ms = now;
       lastAmpUpdate_ms = now;
       breathsCompleted = 0;
@@ -217,26 +261,18 @@ void loop() {
       }
       Serial.println();
 
-      Serial.print(F("  amp_mm(initial)="));
-      Serial.print(amp_mm);
-      Serial.print(F(" (steps="));
-      Serial.print(mmToSteps((float)amp_mm));
-      Serial.println(F(")"));
-
       // 进入新段提示（按bpm响几声）
-      for (uint8_t i = 0; i < segments[segIdx].bpm / 6; i++) { // 简单提示：bpm越大响越多(可自行改)
+      for (uint8_t i = 0; i < segments[segIdx].bpm / 6; i++) {
         beep(800, 60);
         delay(90);
       }
 
-      updateKinematics(segments[segIdx].bpm, amp_mm);
+      // 按策略计算 I:E 与 Tin/Tex
+      exhaleRatio = getExhaleRatioForNow(segIdx, breathsCompleted);
+      updateInhaleExhaleDurations(segments[segIdx].bpm, exhaleRatio);
+      printIERuntime(segments[segIdx].bpm);
 
-      Serial.print(F("  halfCycleDuration_ms="));
-      Serial.print(halfCycleDuration_ms);
-      Serial.print(F(" cruiseSpeed_steps_s="));
-      Serial.println(cruiseSpeed_steps_s, 2);
-
-      // 先移动到呼气末，作为每段的起始相位
+      // 先移动到呼气末，作为每段起始相位
       Serial.println(F("[STATE] -> MOVE_TO_EXHALE_END (phase align)"));
       stepper.moveTo(exhaleEndPos());
       state = ST_MOVE_TO_EXHALE_END;
@@ -244,56 +280,57 @@ void loop() {
 
     case ST_MOVE_TO_EXHALE_END: {
       if (stepper.distanceToGo() == 0) {
-        Serial.println(F("[STATE] At exhale end -> HALF_CYCLE_UP"));
-        // 开始上行半周期
+        Serial.println(F("[STATE] At exhale end -> INHALE_UP"));
+
+        // 吸气半周期速度按 Tin
+        exhaleRatio = getExhaleRatioForNow(segIdx, breathsCompleted);
+        updateInhaleExhaleDurations(segments[segIdx].bpm, exhaleRatio);
+        setSpeedForHalfCycle(inhaleDuration_ms);
+
         stepper.moveTo(inhaleEndPos());
-        state = ST_HALF_CYCLE_UP;
+        state = ST_INHALE_UP;
       }
     } break;
 
-    case ST_HALF_CYCLE_UP: {
-      // 幅值按时间更新（只影响“下一次目标”，不打断当前半周期）
+    case ST_INHALE_UP: {
+      // 幅值按时间更新（只影响下一次目标，不打断当前半周期）
       if (now - lastAmpUpdate_ms >= AMP_UPDATE_INTERVAL_MS) {
         lastAmpUpdate_ms = now;
         updateAmplitude();
-        updateKinematics(segments[segIdx].bpm, amp_mm);
-
         Serial.print(F("[AMP UPDATE] amp_mm="));
         Serial.print(amp_mm);
-        Serial.print(F(" (steps="));
-        Serial.print(mmToSteps((float)amp_mm));
-        Serial.print(F(") halfCycleDuration_ms="));
-        Serial.print(halfCycleDuration_ms);
-        Serial.print(F(" cruiseSpeed_steps_s="));
-        Serial.println(cruiseSpeed_steps_s, 2);
+        Serial.print(F(" steps="));
+        Serial.println(mmToSteps((float)amp_mm));
       }
 
       if (stepper.distanceToGo() == 0) {
-        // 到达吸气末，开始下行
+        // 到达吸气末，开始呼气（下行）
+        exhaleRatio = getExhaleRatioForNow(segIdx, breathsCompleted);
+        updateInhaleExhaleDurations(segments[segIdx].bpm, exhaleRatio);
+        setSpeedForHalfCycle(exhaleDuration_ms);
+
         stepper.moveTo(exhaleEndPos());
-        state = ST_HALF_CYCLE_DOWN;
+        state = ST_EXHALE_DOWN;
       }
     } break;
 
-    case ST_HALF_CYCLE_DOWN: {
+    case ST_EXHALE_DOWN: {
       if (now - lastAmpUpdate_ms >= AMP_UPDATE_INTERVAL_MS) {
         lastAmpUpdate_ms = now;
         updateAmplitude();
-        updateKinematics(segments[segIdx].bpm, amp_mm);
-
         Serial.print(F("[AMP UPDATE] amp_mm="));
         Serial.print(amp_mm);
-        Serial.print(F(" (steps="));
-        Serial.print(mmToSteps((float)amp_mm));
-        Serial.print(F(") halfCycleDuration_ms="));
-        Serial.print(halfCycleDuration_ms);
-        Serial.print(F(" cruiseSpeed_steps_s="));
-        Serial.println(cruiseSpeed_steps_s, 2);
+        Serial.print(F(" steps="));
+        Serial.println(mmToSteps((float)amp_mm));
       }
 
       if (stepper.distanceToGo() == 0) {
         // 完成一个完整呼吸周期（下端点算结束）
         breathsCompleted++;
+
+        // 本次呼吸结束后，按“下一次”策略更新 I:E，并打印（这样你能看到 9bpm 第10次开始变为 1:1.5）
+        exhaleRatio = getExhaleRatioForNow(segIdx, breathsCompleted);
+        updateInhaleExhaleDurations(segments[segIdx].bpm, exhaleRatio);
 
         Serial.print(F("[BREATH DONE] segIdx="));
         Serial.print(segIdx);
@@ -301,17 +338,22 @@ void loop() {
         Serial.print(segments[segIdx].bpm);
         Serial.print(F(" breath#="));
         Serial.print(breathsCompleted);
-        Serial.print(F(" amp_mm="));
+        Serial.print(F("  next I:E=1:"));
+        Serial.print(exhaleRatio, 3);
+        Serial.print(F(" Tin_ms="));
+        Serial.print(inhaleDuration_ms);
+        Serial.print(F(" Tex_ms="));
+        Serial.print(exhaleDuration_ms);
+        Serial.print(F("  amp_mm="));
         Serial.print(amp_mm);
-        Serial.print(F(" STEPS_PER_MM="));
-        Serial.println(STEPS_PER_MM, 4);
+        Serial.println();
 
         // 判断是否需要插入暂停（呼气末暂停）
         const Segment &seg = segments[segIdx];
         if (seg.pauseEvent && !apneaDoneInThisSeg && breathsCompleted >= seg.pauseAfterBreaths) {
           apneaDoneInThisSeg = true;
           t0_ms = now;
-          beep(2000, 200); // 暂停开始提示
+          beep(2000, 200);
 
           Serial.print(F("[APNEA ENTER] segIdx="));
           Serial.print(segIdx);
@@ -341,17 +383,21 @@ void loop() {
             state = ST_SEGMENT_INIT;
           }
         } else {
-          // 继续下一次上行
+          // 下一次吸气：按“当前 breathsCompleted 对应的策略”设置 Tin 速度
+          exhaleRatio = getExhaleRatioForNow(segIdx, breathsCompleted);
+          updateInhaleExhaleDurations(segments[segIdx].bpm, exhaleRatio);
+          setSpeedForHalfCycle(inhaleDuration_ms);
+
           stepper.moveTo(inhaleEndPos());
-          state = ST_HALF_CYCLE_UP;
+          state = ST_INHALE_UP;
         }
       }
     } break;
 
     case ST_APNEA_HOLD: {
-      // 保持在呼气末：目标位置不变（已经在下端点了）
+      // 保持在呼气末
       if (now - t0_ms >= PAUSE_MS) {
-        beep(1000, 150); // 暂停结束提示
+        beep(1000, 150);
 
         Serial.print(F("[APNEA EXIT] segIdx="));
         Serial.print(segIdx);
@@ -360,14 +406,17 @@ void loop() {
         Serial.print(F(" elapsed_ms="));
         Serial.println(now - t0_ms);
 
-        // 暂停结束后继续上行
+        // 暂停结束后继续吸气（按策略设置 Tin）
+        exhaleRatio = getExhaleRatioForNow(segIdx, breathsCompleted);
+        updateInhaleExhaleDurations(segments[segIdx].bpm, exhaleRatio);
+        setSpeedForHalfCycle(inhaleDuration_ms);
+
         stepper.moveTo(inhaleEndPos());
-        state = ST_HALF_CYCLE_UP;
+        state = ST_INHALE_UP;
       }
     } break;
 
     case ST_DONE: {
-      // 实验结束：停住并可选择断使能
       stepper.setSpeed(0);
       // digitalWrite(ENA_PIN, HIGH); // 若 HIGH=Disable，可启用
     } break;
